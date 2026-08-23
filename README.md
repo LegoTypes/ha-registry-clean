@@ -127,14 +127,18 @@ configured:
 > integration under Settings > Devices & Services, then run the Integration
 > registry scan action to rebuild the list.
 
-The scan runs on `@time_trigger("startup")`, so every pyscript reload and every
-Home Assistant restart refreshes the list, and again after any applied cleanup.
+The scan runs at startup, after any applied cleanup, and **whenever entities or
+devices are removed from the registry** — so deleting an integration updates the
+dropdown by itself, with no reload and nothing to remember. Removals arrive one
+per entity, so the rescan is debounced: it fires about five seconds after the
+last one.
 
-**Refreshing an open page.** Core has no "service description changed" event —
-the frontend refetches descriptions when it sees `service_registered` /
-`service_removed`, which only `hass.services.async_register` fires. Updating a
-description does not fire anything, so a browser tab that is already open keeps
-the old options until you reload the page.
+An open Developer Tools page updates too. Core has no "service description
+changed" event — the frontend refetches when it sees `service_registered`, which
+only `hass.services.async_register` fires — so after publishing a changed
+description the cleanup service is re-registered with its own existing handler,
+making that event true rather than fabricated. This happens only when the
+options actually change, since it costs every connected frontend a refetch.
 
 ### Cleanup
 

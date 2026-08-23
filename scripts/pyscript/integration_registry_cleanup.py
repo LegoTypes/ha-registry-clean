@@ -67,6 +67,11 @@ CLEANUP_SERVICE = "integration_registry_cleanup"
 SCAN_SERVICE = "integration_registry_scan"
 BACKUP_ROOT = "registry_backups"
 
+# Deleting an integration removes its entities one at a time, so a rescan is
+# debounced under a single task name: each new removal kills the pending one.
+RESCAN_TASK = "integration_registry_rescan"
+RESCAN_DEBOUNCE = 5
+
 # .storage prefixes that belong to Home Assistant or HACS even when they match
 # the domain glob -- never touch these.
 STORAGE_KEEP = ("core.", "hacs.", "lovelace")
@@ -251,13 +256,13 @@ def _refresh_domain_selector(options, blocked):
             f"{SCAN_SERVICE}: {PYSCRIPT_DOMAIN}.{CLEANUP_SERVICE} has no published "
             "description yet; leaving the domain field alone"
         )
-        return False
+        return False, False
 
     description = copy.deepcopy(published)
     field = description.get("fields", {}).get("domain")
     if field is None:
         log.warning(f"{SCAN_SERVICE}: {CLEANUP_SERVICE} has no 'domain' field")
-        return False
+        return False, False
 
     if _ORIGINAL_DOMAIN_SELECTOR is None:
         _ORIGINAL_DOMAIN_SELECTOR = copy.deepcopy(field.get("selector"))
@@ -282,7 +287,42 @@ def _refresh_domain_selector(options, blocked):
         field["selector"] = copy.deepcopy(_ORIGINAL_DOMAIN_SELECTOR)
         field["description"] = _empty_dropdown_help(blocked)
 
+    if description == published:
+        # Already published exactly this; re-registering would make every
+        # connected frontend refetch the whole service description set for
+        # nothing.
+        return True, False
+
     async_set_service_schema(hass, PYSCRIPT_DOMAIN, CLEANUP_SERVICE, description)
+    _republish_service()
+    return True, True
+
+
+def _republish_service():
+    """Make open pages pick up the new description.
+
+    Core fires no event when a description changes; the frontend refetches when
+    a service is registered.  Re-registering the cleanup service with its own
+    existing handler makes that event true rather than fabricated.
+    `ServiceRegistry._async_register` only swaps the Service object and fires
+    the event -- it does not touch the description cache, so the schema
+    published just above survives.
+    """
+    existing = hass.services.async_services_for_domain(PYSCRIPT_DOMAIN).get(
+        CLEANUP_SERVICE
+    )
+    if existing is None:
+        log.warning(f"{SCAN_SERVICE}: {CLEANUP_SERVICE} is not registered")
+        return False
+    hass.services.async_register(
+        PYSCRIPT_DOMAIN,
+        CLEANUP_SERVICE,
+        existing.job.target,
+        existing.schema,
+        existing.supports_response,
+        existing.job.job_type,
+        description_placeholders=existing.description_placeholders,
+    )
     return True
 
 
@@ -344,13 +384,16 @@ def _scan(refresh_selector):
         "candidates": [option["value"] for option in options],
         "skipped_configured": sorted(skipped),
         "selector_refreshed": False,
+        "selector_changed": False,
     }
     if refresh_selector:
         blocked = [
             _label(domain, found[domain], tombstones_only=True)
             for domain in sorted(skipped)
         ]
-        result["selector_refreshed"] = _refresh_domain_selector(options, blocked)
+        refreshed, changed = _refresh_domain_selector(options, blocked)
+        result["selector_refreshed"] = refreshed
+        result["selector_changed"] = changed
     return result
 
 
@@ -615,6 +658,40 @@ fields:
     return result
 
 
+def _rescan_debounced():
+    """Rescan once a burst of registry removals has settled.
+
+    task.unique kills the rescan still waiting from the previous event, so
+    deleting an integration -- which removes its entities one by one -- ends in
+    a single scan a few seconds after the last removal.
+    """
+    task.unique(RESCAN_TASK)
+    task.sleep(RESCAN_DEBOUNCE)
+    result = _scan(True)
+    if result["selector_changed"]:
+        log.info(
+            f"{SCAN_SERVICE}: registry removals settled; dropdown now offers "
+            f"{len(result['candidates'])} domain(s)"
+        )
+
+
+# Removals only.  A removal is what creates tombstones, and entity creation
+# fires in bulk for every integration at startup -- triggering on it would spawn
+# a task per entity for no gain.  A domain that becomes configured again is
+# caught by the next scan, and until then picking it merely aborts with
+# "config entry still exists".
+@event_trigger("entity_registry_updated", "action == 'remove'")
+def _rescan_after_entity_removal(**kwargs):
+    """Deleting an integration should update the dropdown by itself."""
+    _rescan_debounced()
+
+
+@event_trigger("device_registry_updated", "action == 'remove'")
+def _rescan_after_device_removal(**kwargs):
+    """Same, for integrations whose devices outlive their entities."""
+    _rescan_debounced()
+
+
 @time_trigger("startup")
 def _refresh_domain_dropdown_at_startup():
     """Build the dropdown once pyscript is up, and on every reload."""
@@ -710,10 +787,10 @@ def _notify_scan(result):
             f"{body}\nStill configured, so not offered: {skipped}. Delete the "
             "integration first if you mean to purge one of these.\n"
         )
-    if result["selector_refreshed"]:
+    if result["selector_changed"]:
         body = (
             f"{body}\nThe domain dropdown on the cleanup action has been "
-            "rebuilt. Reload this page if it still shows a text box."
+            "rebuilt; open pages pick it up on their own."
         )
     persistent_notification.create(
         title="Integration registry scan",
