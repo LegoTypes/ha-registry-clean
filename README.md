@@ -89,18 +89,6 @@ pyscript loads the file on **upload** — a bare `touch` is not enough, and no
 restart is needed. Both actions then appear under **Developer Tools → Actions**;
 search for *Integration registry*.
 
-### Why this is not a HACS custom repository
-
-HACS cannot install pyscript scripts. Its categories are `appdaemon`,
-`integration`, `lovelace`/`plugin`, `python_script`, `template` and `theme` —
-there is no pyscript category, and the closest one, `python_script`, downloads
-into `/config/python_scripts/`, a different directory belonging to Home
-Assistant's own `python_script` integration. pyscript only ever reads
-`<config>/pyscript` (`FOLDER = "pyscript"` in its `const.py`, not configurable),
-so adding this repository to HACS as a custom repository would place the file
-where nothing loads it. Use one of the copy methods above; HACS is only involved
-in installing pyscript itself.
-
 ### Scan and the domain dropdown
 
 `pyscript.integration_registry_scan` buckets every registry entry — live and
