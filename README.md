@@ -121,11 +121,11 @@ When nothing qualifies, the field stays a plain text box and its help text says
 what it is waiting for, naming any domain that has tombstones but is still
 configured:
 
-> No domain qualifies for the dropdown right now: one is listed only once it has
-> registry tombstones and no config entry. These have tombstones but are still
-> configured: span_panel - 216 entity tombstones, 2 device tombstones. Delete the
-> integration under Settings > Devices & Services, then run the Integration
-> registry scan action to rebuild the list.
+> Nothing needs cleaning: an integration you deleted is listed here only if it
+> left registry tombstones behind, and none has. Tombstones do exist for these,
+> but their integration is still configured, so they are not offered:
+> some_integration - 216 entity tombstones, 2 device tombstones. Delete one under
+> Settings > Devices & Services to clean it; the list rebuilds itself.
 
 The scan runs at startup, after any applied cleanup, and **whenever entities or
 devices are removed from the registry** — so deleting an integration updates the

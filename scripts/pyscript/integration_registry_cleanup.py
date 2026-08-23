@@ -214,21 +214,17 @@ def _empty_dropdown_help(blocked):
     """
     lines = [
         "Integration domain to purge, as it appears in its manifest.",
-        "No domain qualifies for the dropdown right now: one is listed only"
-        " once it has registry tombstones and no config entry.",
+        "Nothing needs cleaning: an integration you deleted is listed here only"
+        " if it left registry tombstones behind, and none has.",
     ]
     if blocked:
         lines.append(
-            f"These have tombstones but are still configured: {'; '.join(blocked)}."
+            "Tombstones do exist for these, but their integration is still"
+            f" configured, so they are not offered: {'; '.join(blocked)}."
         )
         lines.append(
-            "Delete the integration under Settings > Devices & Services, then run"
-            " the Integration registry scan action to rebuild the list."
-        )
-    else:
-        lines.append(
-            "Nothing has been deleted recently. Delete an integration, then run"
-            " the Integration registry scan action to rebuild the list."
+            "Delete one under Settings > Devices & Services to clean it; the"
+            " list rebuilds itself."
         )
     lines.append(
         "Home Assistant also drops tombstones by itself 30 days after the"
@@ -768,10 +764,9 @@ def _notify_scan(result):
         )
     else:
         body = (
-            "No domain qualifies for the dropdown, so the cleanup action keeps "
-            "a plain text field. A domain is listed once it has registry "
-            "tombstones and no config entry: delete the integration under "
-            "Settings > Devices & Services, then run this scan again.\n"
+            "Nothing needs cleaning: no deleted integration has left registry "
+            "tombstones behind, so the cleanup action keeps a plain text "
+            "field.\n"
         )
 
     quiet = len([d for d in found if not _has_tombstones(found[d])])
@@ -785,7 +780,7 @@ def _notify_scan(result):
         skipped = ", ".join([f"`{d}`" for d in result["skipped_configured"]])
         body = (
             f"{body}\nStill configured, so not offered: {skipped}. Delete the "
-            "integration first if you mean to purge one of these.\n"
+            "integration first to clean one of these.\n"
         )
     if result["selector_changed"]:
         body = (
