@@ -47,24 +47,59 @@ one. It registers two actions:
 | `pyscript.integration_registry_scan` | read-only; lists what each domain has left behind and builds the dropdown below |
 | `pyscript.integration_registry_cleanup` | removes it |
 
-### Install
+### Prerequisites: pyscript, from HACS
+
+The script runs inside the [pyscript](https://github.com/custom-components/pyscript)
+custom integration, which is in the HACS default store — no custom repository
+needed for it:
+
+1. **HACS** → **Integrations** → search **Pyscript** → **Download**.
+2. Restart Home Assistant.
+3. Add to `configuration.yaml`:
+
+   ```yaml
+   pyscript:
+     allow_all_imports: true
+     hass_is_global: true
+   ```
+
+   `allow_all_imports` is required — the script imports the registry helpers
+   from `homeassistant.helpers`. `hass_is_global` gives it the `hass` object.
+4. Restart Home Assistant again so the configuration takes effect.
+
+### Install the script
+
+Copy the one file into `/config/pyscript/`, whichever way suits your setup:
 
 ```sh
+# from a clone of this repository, over SSH
 scp scripts/pyscript/integration_registry_cleanup.py <host>:/config/pyscript/
 ```
 
-pyscript hot-reloads on file **upload** (a bare `touch` is not enough), so no
-restart is needed once pyscript itself is configured:
-
-```yaml
-# configuration.yaml -- needs one core restart to take effect
-pyscript:
-  allow_all_imports: true
-  hass_is_global: true
+```sh
+# or on the Home Assistant host itself (SSH / Terminal add-on)
+curl -fsSL -o /config/pyscript/integration_registry_cleanup.py \
+  https://raw.githubusercontent.com/LegoTypes/ha-registry-clean/main/scripts/pyscript/integration_registry_cleanup.py
 ```
 
-`allow_all_imports` is required: the script imports the registry helpers from
-`homeassistant.helpers`. `hass_is_global` gives it the `hass` object.
+With the **Studio Code Server** or **File editor** add-on, or a Samba share,
+create `/config/pyscript/integration_registry_cleanup.py` and paste the file in.
+
+pyscript loads the file on **upload** — a bare `touch` is not enough, and no
+restart is needed. Both actions then appear under **Developer Tools → Actions**;
+search for *Integration registry*.
+
+### Why this is not a HACS custom repository
+
+HACS cannot install pyscript scripts. Its categories are `appdaemon`,
+`integration`, `lovelace`/`plugin`, `python_script`, `template` and `theme` —
+there is no pyscript category, and the closest one, `python_script`, downloads
+into `/config/python_scripts/`, a different directory belonging to Home
+Assistant's own `python_script` integration. pyscript only ever reads
+`<config>/pyscript` (`FOLDER = "pyscript"` in its `const.py`, not configurable),
+so adding this repository to HACS as a custom repository would place the file
+where nothing loads it. Use one of the copy methods above; HACS is only involved
+in installing pyscript itself.
 
 ### Scan and the domain dropdown
 
