@@ -74,10 +74,12 @@ STORAGE_KEEP = ("core.", "hacs.", "lovelace")
 # Registry files copied into the backup directory before anything is changed.
 REGISTRY_FILES = ("core.entity_registry", "core.device_registry", "core.restore_state")
 
-# The free-text selector the cleanup action declares in its own docstring,
-# captured the first time the dropdown is built so it can be put back when a
-# scan finds nothing to offer.  Reset whenever pyscript reloads this file.
+# The free-text selector and description the cleanup action declares in its own
+# docstring, captured the first time the dropdown is built so they can be put
+# back when a scan finds something to offer.  Reset when pyscript reloads this
+# file.
 _ORIGINAL_DOMAIN_SELECTOR = None
+_ORIGINAL_DOMAIN_DESCRIPTION = None
 
 
 def _device_container(dev_reg):
@@ -181,17 +183,56 @@ def _has_tombstones(counts):
     return bool(counts["deleted_entities"] or counts["deleted_devices"])
 
 
-def _label(domain, counts):
-    """Dropdown label: the domain plus what is actually left behind."""
+def _label(domain, counts, tombstones_only=False):
+    """Dropdown label: the domain plus what is actually left behind.
+
+    `tombstones_only` trims the label to the counts a sentence about tombstones
+    cares about, so naming a blocked domain does not drag its live entity count
+    along with it.
+    """
     parts = []
     for key, one, many in LABEL_PARTS:
+        if tombstones_only and not key.startswith("deleted_"):
+            continue
         count = counts[key]
         if count:
             parts.append(f"{count} {one if count == 1 else many}")
     return f"{domain} - {', '.join(parts)}"
 
 
-def _refresh_domain_selector(options):
+def _empty_dropdown_help(blocked):
+    """What the `domain` field says when there is no dropdown to show.
+
+    An empty text box under a description that talks about a dropdown reads as
+    a bug, so the field explains what it is waiting for -- and names the
+    domains that would qualify but for a config entry.
+    """
+    lines = [
+        "Integration domain to purge, as it appears in its manifest.",
+        "No domain qualifies for the dropdown right now: one is listed only"
+        " once it has registry tombstones and no config entry.",
+    ]
+    if blocked:
+        lines.append(
+            f"These have tombstones but are still configured: {'; '.join(blocked)}."
+        )
+        lines.append(
+            "Delete the integration under Settings > Devices & Services, then run"
+            " the Integration registry scan action to rebuild the list."
+        )
+    else:
+        lines.append(
+            "Nothing has been deleted recently. Delete an integration, then run"
+            " the Integration registry scan action to rebuild the list."
+        )
+    lines.append(
+        "Home Assistant also drops tombstones by itself 30 days after the"
+        " entity was removed, which empties this list on its own."
+    )
+    return " ".join(lines)
+
+
+def _refresh_domain_selector(options, blocked):
     """Swap the cleanup action's `domain` field to a dropdown of `options`.
 
     This is the same call pyscript makes to publish a service's docstring YAML,
@@ -200,6 +241,7 @@ def _refresh_domain_selector(options):
     edited, which keeps the docstring the single source of truth.
     """
     global _ORIGINAL_DOMAIN_SELECTOR
+    global _ORIGINAL_DOMAIN_DESCRIPTION
 
     published = async_get_cached_service_description(
         hass, PYSCRIPT_DOMAIN, CLEANUP_SERVICE
@@ -219,6 +261,7 @@ def _refresh_domain_selector(options):
 
     if _ORIGINAL_DOMAIN_SELECTOR is None:
         _ORIGINAL_DOMAIN_SELECTOR = copy.deepcopy(field.get("selector"))
+        _ORIGINAL_DOMAIN_DESCRIPTION = field.get("description")
 
     if options:
         # custom_value does double duty: it keeps the field usable for a domain
@@ -234,8 +277,10 @@ def _refresh_domain_selector(options):
                 "options": options,
             }
         }
+        field["description"] = _ORIGINAL_DOMAIN_DESCRIPTION
     else:
         field["selector"] = copy.deepcopy(_ORIGINAL_DOMAIN_SELECTOR)
+        field["description"] = _empty_dropdown_help(blocked)
 
     async_set_service_schema(hass, PYSCRIPT_DOMAIN, CLEANUP_SERVICE, description)
     return True
@@ -301,7 +346,11 @@ def _scan(refresh_selector):
         "selector_refreshed": False,
     }
     if refresh_selector:
-        result["selector_refreshed"] = _refresh_domain_selector(options)
+        blocked = [
+            _label(domain, found[domain], tombstones_only=True)
+            for domain in sorted(skipped)
+        ]
+        result["selector_refreshed"] = _refresh_domain_selector(options, blocked)
     return result
 
 
@@ -642,8 +691,10 @@ def _notify_scan(result):
         )
     else:
         body = (
-            "No domain has registry tombstones left to clean. The cleanup "
-            "action keeps its plain text field.\n"
+            "No domain qualifies for the dropdown, so the cleanup action keeps "
+            "a plain text field. A domain is listed once it has registry "
+            "tombstones and no config entry: delete the integration under "
+            "Settings > Devices & Services, then run this scan again.\n"
         )
 
     quiet = len([d for d in found if not _has_tombstones(found[d])])

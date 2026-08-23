@@ -117,6 +117,16 @@ on those anyway. Options are ordered by how much is left behind, worst first.
 only when `custom_value` is set, and a plain unfiltered `ha-select` otherwise.
 `custom_value` also means you can still type a domain the scan did not offer.
 
+When nothing qualifies, the field stays a plain text box and its help text says
+what it is waiting for, naming any domain that has tombstones but is still
+configured:
+
+> No domain qualifies for the dropdown right now: one is listed only once it has
+> registry tombstones and no config entry. These have tombstones but are still
+> configured: span_panel - 216 entity tombstones, 2 device tombstones. Delete the
+> integration under Settings > Devices & Services, then run the Integration
+> registry scan action to rebuild the list.
+
 The scan runs on `@time_trigger("startup")`, so every pyscript reload and every
 Home Assistant restart refreshes the list, and again after any applied cleanup.
 
