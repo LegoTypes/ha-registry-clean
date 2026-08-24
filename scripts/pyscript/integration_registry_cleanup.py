@@ -47,8 +47,10 @@ pyscript.integration_registry_cleanup
                                                             (default: false)
   backup           copy the registries aside first          (default: true)
 
-A dry run republishes ``entities`` and ``devices`` as checkbox lists holding
-exactly what it found, every box ticked.  Untick what you want to keep, set
+A dry run reports through its response and the checkboxes, never a
+notification; only a run that actually removes something raises one.  It
+republishes ``entities`` and ``devices`` as checkbox lists holding exactly what
+it found, every box ticked.  Untick what you want to keep, set
 dry_run to false, and run it again.  The selection is a filter, not a work
 order: the apply pass recomputes the orphans and purges the intersection, so a
 stale list can never remove something that has since become owned again.
@@ -719,7 +721,6 @@ fields:
     if not domain:
         result["aborted"] = "No domain given. Pass the integration domain to purge."
         log.error(f"{CLEANUP_SERVICE}: {result['aborted']}")
-        _notify(result)
         return result
 
     # The checkbox lists are published server-side and shared by every tab, so a
@@ -735,7 +736,6 @@ fields:
             f"'{domain}' first."
         )
         log.error(f"{CLEANUP_SERVICE}: {result['aborted']}")
-        _notify(result)
         return result
 
     live_entry_ids = _live_entry_ids()
@@ -828,7 +828,6 @@ fields:
             },
         )
         log.info(_summary(result, "DRY RUN"))
-        _notify(result)
         return result
 
     if backup:
@@ -903,7 +902,8 @@ fields:
         )
 
     log.info(_summary(result, "APPLIED"))
-    _notify(result)
+    if _changed(result):
+        _notify(result)
 
     # What was just purged is no longer a candidate, and the checkboxes that
     # listed it are now stale.
@@ -992,29 +992,35 @@ def _summary(result, mode):
     return "\n".join(lines)
 
 
+def _changed(result):
+    """Whether a run actually removed anything."""
+    for _label, count in _counts(result):
+        if count:
+            return True
+    return False
+
+
 def _notify(result):
-    mode = "Dry run" if result["dry_run"] else "Applied"
-    if result["aborted"]:
-        body = f"**Aborted.** {result['aborted']}"
-    else:
-        rows = "\n".join([f"| {label} | {count} |" for label, count in _counts(result)])
-        body = f"| item | count |\n|---|---|\n{rows}\n"
-        if result["filter"]:
-            body = f"{body}\nFilter: `{result['filter']}`"
-        if result["statistics_note"]:
-            body = f"{body}\n\n{result['statistics_note']}"
-        if result["backup_dir"]:
-            body = f"{body}\nBackup: `{result['backup_dir']}`"
-        if result["restore_with"]:
-            body = f"{body}\n\n{result['restore_with']}"
-        if result["dry_run"]:
-            body = (
-                f"{body}\n\nNothing changed. The entity and device checkboxes on "
-                "the cleanup action now list exactly this, every box ticked; "
-                "untick what you want to keep and run again with `dry_run: false`."
-            )
+    """Report an applied run.
+
+    Only raised when something was actually removed: a dry run is already
+    reported by its response and by the checkboxes it fills in, and a run that
+    removes nothing is not news.
+    """
+    rows = "\n".join(
+        [f"| {label} | {count} |" for label, count in _counts(result) if count]
+    )
+    body = f"| item | count |\n|---|---|\n{rows}\n"
+    if result["filter"]:
+        body = f"{body}\nFilter: `{result['filter']}`"
+    if result["statistics_note"]:
+        body = f"{body}\n\n{result['statistics_note']}"
+    if result["backup_dir"]:
+        body = f"{body}\nBackup: `{result['backup_dir']}`"
+    if result["restore_with"]:
+        body = f"{body}\n\n{result['restore_with']}"
     persistent_notification.create(
-        title=f"{mode}: {result['domain'] or 'unknown'} registry cleanup",
+        title=f"Cleaned up {result['domain']}",
         message=body,
         notification_id=f"{CLEANUP_SERVICE}_{result['domain'] or 'unset'}",
     )

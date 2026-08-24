@@ -201,8 +201,10 @@ never remove something that has since become owned again. The checkboxes are
 published server-side and shared by every tab, so they are stamped with the
 domain they were built for; applying them against a different domain aborts.
 
-It returns a response with the full lists, logs a summary, and raises a
-persistent notification. Re-running is a no-op.
+It returns a response with the full lists and logs a summary. A persistent
+notification is raised only when a run actually removes something — a dry run is
+already reported by its response and by the checkboxes it fills in, and a run
+that removes nothing is not news. Re-running is a no-op.
 
 ### Statistics
 
