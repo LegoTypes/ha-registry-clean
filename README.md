@@ -14,6 +14,26 @@ Scripts are grouped by the runtime they need; `pyscript/` holds those that run
 inside the [pyscript](https://github.com/custom-components/pyscript) custom
 integration.
 
+## ⚠️ Read this first
+
+**Take a full Home Assistant backup before you use this.** A live run edits your
+entity and device registries — the records every entity_id, name, area and
+customisation in your installation hangs off. A mistake here is not cosmetic.
+
+The tool tries hard to make that safe: it defaults to a dry run, it shows you
+exactly what it will remove before it removes anything, it never touches a
+registry entry that a config entry still owns, and with `backup: true` it copies
+the registry files aside first. None of that is a substitute for a backup you
+made yourself. In particular, `purge_statistics` deletes rows from the recorder
+database, which the tool's own backup does **not** cover.
+
+**This software is provided "as is", without warranty of any kind, express or
+implied, including but not limited to the warranties of merchantability, fitness
+for a particular purpose and noninfringement.** It is not warranted to be fit
+for any particular purpose, and you are solely responsible for how you use it
+and for anything that results. If you are not comfortable restoring your Home
+Assistant installation from a backup, do not run it.
+
 ## The problem
 
 Deleting an integration does not erase its registry history. Entities become
