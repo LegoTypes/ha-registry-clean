@@ -57,6 +57,32 @@ Home Assistant only purges tombstones after `ORPHANED_ENTITY_KEEP_SECONDS`
 config entry asking for a different naming scheme still inherits the previous
 entity_ids. Purging the tombstones is what breaks that inheritance.
 
+### Or wait 30 days
+
+Tombstones do expire on their own. A daily cleanup
+(`CLEANUP_INTERVAL = 3600 * 24`) drops entity tombstones 30 days after they were
+orphaned, and device tombstones on the same schedule
+(`ORPHANED_ENTITY_KEEP_SECONDS`, `ORPHANED_DEVICE_KEEP_SECONDS`). So for the
+naming problem, this tool buys you **immediacy, not capability** — everything it
+removes from the registries would eventually go by itself.
+
+The catch is that waiting and reinstalling are mutually exclusive. Reinstalling
+*consumes* the tombstone: `async_get_or_create` pops it and hands the old
+entity_id straight back, which restarts nothing and fixes nothing. The 30-day
+clock only helps if you leave the integration uninstalled for a month. If you
+want to reinstall today and have it name things the way the new config entry
+asks, the tombstones have to go now.
+
+Two things qualify that:
+
+- **Only orphaned tombstones expire.** One whose config entry still exists has
+  no `orphaned_timestamp` and is kept indefinitely. This tool does not touch
+  those either, so nothing changes there.
+- **Some leftovers never expire at all.** `.storage/<domain>*` files and
+  long-term statistics are kept forever, with no cleanup of any kind behind
+  them. `purge_storage` and `purge_statistics` are the only way those go, at any
+  point. (`core.restore_state` rows are the exception; they lapse after 7 days.)
+
 ## scripts/pyscript/integration_registry_cleanup.py
 
 The integration to purge is an argument; nothing in the script is specific to
@@ -167,7 +193,9 @@ When nothing qualifies, the field stays a plain text box and says so:
 
 > Nothing needs cleaning: every registry entry still belongs to a configuration
 > that exists, so there are no orphans to list. Delete an integration — or one
-> config entry of one — and its leftovers appear here on their own.
+> config entry of one — and its leftovers appear here on their own. Home
+> Assistant also drops entity tombstones by itself 30 days after the entity was
+> removed.
 
 The scan runs at startup, after any applied cleanup, and **whenever entities or
 devices are removed from the registry** — so deleting an integration updates the
