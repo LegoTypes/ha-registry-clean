@@ -89,43 +89,65 @@ pyscript loads the file on **upload** — a bare `touch` is not enough, and no
 restart is needed. Both actions then appear under **Developer Tools → Actions**;
 search for *Integration registry*.
 
+### What counts as removable
+
+Nothing is decided per domain. Core records the owning config entry on every
+registry entry and clears it when that entry is deleted, so `config_entry_id`
+answers "does a configuration still own this?" — core says so itself:
+
+```python
+class DeletedDeviceEntry:
+    # config_entry_id is None for orphaned deleted devices, i.e. devices whose
+    # owning config entry has been removed
+    config_entry_id: str | None = attr.ib()
+```
+
+| | `config_entry_id` | action |
+| --- | --- | --- |
+| tombstone | `None`, or an entry that no longer exists | **purge** — orphaned |
+| tombstone | an entry that exists | keep — a live configuration owns it |
+| live entity | an entry that no longer exists | **purge** — stale |
+| live entity | `None` | **never touched** — this is how YAML integrations register (`person`) |
+| device | no surviving entry | **purge** |
+
+Two consequences worth knowing:
+
+- **One deleted device can be cleaned while others keep running.** An
+  integration with two panels configured, one of them deleted, leaves only the
+  deleted one's entries ownerless. There is no "delete the integration first"
+  step and no domain-wide refusal.
+- **Sub-devices need no special handling.** A device belongs to exactly one
+  config entry (`config_entries` is now a deprecated shim around
+  `config_entry_id`), and `via_device_id` links a sub-device to its parent
+  without affecting ownership. A sub-device of a live entry is protected; a
+  sub-device of a deleted one orphans along with its parent.
+
 ### Scan and the domain dropdown
 
-`pyscript.integration_registry_scan` buckets every registry entry — live and
-tombstoned, entities and devices, plus matching `.storage` files — by the
-integration that owns it, then rewrites the `domain` field of the cleanup action
-into a dropdown of what it found:
+`pyscript.integration_registry_scan` buckets every ownerless registry entry by
+the integration that owns it, then rewrites the `domain` field of the cleanup
+action into a dropdown of what it found:
 
 ```
-span_panel - 229 entity tombstones, 2 device tombstones, 3 storage files
+span_panel - 216 entity tombstones, 2 device tombstones, 3 storage files
 ```
 
 | field | default | meaning |
 | --- | --- | --- |
-| `refresh_selector` | `true` | rebuild the cleanup action's dropdown |
+| `refresh_selector` | `true` | rebuild the dropdown, and blank the checkbox lists a scan makes stale |
 | `notification` | `true` | raise a persistent notification with the table |
 
-**Only domains with tombstones are offered.** A domain with live entries and no
-tombstones is an integration that is working fine — `person` and the other
-YAML-configured core integrations land there, and offering them would invite
-someone to purge a running integration. Domains that still have a config entry
-are listed separately as "still configured", because the cleanup refuses to run
-on those anyway. Options are ordered by how much is left behind, worst first.
+Options are ordered by how much is left behind, worst first. **The dropdown is
+searchable** — type to filter it. That comes from `custom_value`:
+`ha-selector-select` renders the filtering `ha-generic-picker` only when
+`custom_value` is set, and a plain unfiltered `ha-select` otherwise.
+`custom_value` also means you can type a domain the scan did not offer.
 
-**The dropdown is searchable** — type to filter it. That comes from
-`custom_value`: `ha-selector-select` renders the filtering `ha-generic-picker`
-only when `custom_value` is set, and a plain unfiltered `ha-select` otherwise.
-`custom_value` also means you can still type a domain the scan did not offer.
+When nothing qualifies, the field stays a plain text box and says so:
 
-When nothing qualifies, the field stays a plain text box and its help text says
-what it is waiting for, naming any domain that has tombstones but is still
-configured:
-
-> Nothing needs cleaning: an integration you deleted is listed here only if it
-> left registry tombstones behind, and none has. Tombstones do exist for these,
-> but their integration is still configured, so they are not offered:
-> some_integration - 216 entity tombstones, 2 device tombstones. Delete one under
-> Settings > Devices & Services to clean it; the list rebuilds itself.
+> Nothing needs cleaning: every registry entry still belongs to a configuration
+> that exists, so there are no orphans to list. Delete an integration — or one
+> config entry of one — and its leftovers appear here on their own.
 
 The scan runs at startup, after any applied cleanup, and **whenever entities or
 devices are removed from the registry** — so deleting an integration updates the
@@ -142,15 +164,27 @@ options actually change, since it costs every connected frontend a refetch.
 
 ### Cleanup
 
-Call it from **Developer Tools → Actions**. Delete the integration's config
-entry first — the action refuses to run while one exists.
+Call it from **Developer Tools → Actions**.
 
 | field | default | meaning |
 | --- | --- | --- |
 | `domain` | *(required)* | integration domain to purge; searchable dropdown built by the scan |
-| `dry_run` | `true` | report only, change nothing |
-| `purge_storage` | `false` | also remove `.storage/<domain>*` and the domain's `core.restore_state` rows |
-| `backup` | `true` | save everything it touches under `/config/registry_backups/` first (see below) |
+| `dry_run` | `true` | report only, and fill in the checkboxes below |
+| `entity_filter` | — | entity_id glob narrowing the candidates, e.g. `*_energy_*` |
+| `entities` | *(filled by the dry run)* | entities to purge, every box ticked |
+| `devices` | *(filled by the dry run)* | devices to purge, likewise |
+| `purge_storage` | `false` | also remove the integration's `.storage` files and its `core.restore_state` rows |
+| `purge_statistics` | `false` | also clear long-term statistics for the purged entity_ids |
+| `backup` | `true` | save everything it touches under `/config/registry_backups/` first |
+
+**The flow is dry run, then apply.** A dry run reports what it found *and*
+republishes `entities` and `devices` as checkbox lists holding exactly that,
+every box ticked — so the common case needs no clicking. Untick anything you
+want to keep, set `dry_run: false`, and run it again.
+
+`entity_filter` narrows what the dry run offers rather than what it hides:
+anything the glob excludes never appears as a checkbox and is never touched. Use
+it to cut a long list down before unticking within it.
 
 ```yaml
 action: pyscript.integration_registry_cleanup
@@ -158,10 +192,32 @@ data:
   domain: some_integration
   dry_run: false
   purge_storage: true
+  purge_statistics: true
 ```
+
+The selection is a **filter, not a work order**: the apply pass recomputes the
+orphans and purges the intersection, so a list left sitting in an open tab can
+never remove something that has since become owned again. The checkboxes are
+published server-side and shared by every tab, so they are stamped with the
+domain they were built for; applying them against a different domain aborts.
 
 It returns a response with the full lists, logs a summary, and raises a
 persistent notification. Re-running is a no-op.
+
+### Statistics
+
+States expire under the recorder's retention (10 days by default), but
+long-term statistics are kept forever, so a deleted integration's statistics sit
+in the recorder database indefinitely and show up in **Developer Tools →
+Statistics** as no longer being recorded. `purge_statistics` clears them for the
+entity_ids being purged, via `list_statistic_ids` and the recorder's
+`async_clear_statistics`.
+
+One guard matters: **entity ids get recycled**. An id that something currently
+uses is never cleared, because a working entity that inherited a purged
+tombstone's entity_id would otherwise lose its history. Statistics are also
+*not* covered by the backup below — they live in the recorder database, not in
+`.storage`.
 
 ### Backup and recovery
 
@@ -175,6 +231,11 @@ flat, timestamped directory before anything is changed:
 ├── core.restore_state       copied
 └── <domain>*                moved — the backup is the only remaining copy
 ```
+
+`.storage` files are picked per config entry, not per domain: a file naming an
+entry id that still exists is never touched, and a shared file with no entry id
+in its name (`<domain>_settings`) is kept while any config entry for the
+integration remains.
 
 The path is in the action's response (`backup_dir`), the log summary, and the
 persistent notification, alongside the undo instructions.
@@ -201,20 +262,21 @@ backup taken beforehand is the only way back.
 - The registries are edited **in memory** through `entity_registry.async_get` /
   `device_registry.async_get`. Editing the `.storage` JSON directly does not
   work: Home Assistant overwrites it on the next flush of its in-memory copy.
-- Live entities and devices are removed before the tombstone sweep, because
-  `async_remove` / `async_remove_device` create tombstones of their own.
-- The dropdown is published with `async_set_service_schema`, the same helper
-  pyscript itself calls to publish a docstring's YAML. The already-registered
-  description is read back with `async_get_cached_service_description` and
-  edited, so the docstring stays the single source of truth and the original
-  text selector can be restored when a scan finds nothing to offer.
+- Removing a live orphan creates a tombstone of its own, so the tombstone sweep
+  runs against a freshly collected list rather than the one gathered for the
+  report.
+- The dropdown and the checkbox lists are published with
+  `async_set_service_schema`, the same helper pyscript itself calls to publish a
+  docstring's YAML. The already-registered description is read back with
+  `async_get_cached_service_description` and edited, so the docstring stays the
+  single source of truth and the declared selectors can be restored.
 - `task.executor` accepts only real Python functions, never pyscript-defined
   ones, so blocking work is handed to stdlib callables one call at a time
-  (`os.listdir`, `glob.glob`, `shutil.copy2`, `shutil.move`, `os.remove`).
+  (`os.listdir`, `shutil.copy2`, `shutil.move`, `os.remove`), plus
+  `list_statistic_ids`, which queries the recorder database.
 - `DeviceRegistry.devices` and `.deleted_devices` became deprecation-reporting
   views in 2026.9, so `_devices` / `_deleted_devices` are preferred with a
-  fallback for older cores. `DeletedDeviceEntry` carries an explicit `domain`;
-  `DeviceEntry` does not, hence the `getattr` in `_device_domains`.
+  fallback for older cores.
 - `RestoreStateData` has no scheduled save; entries are popped from
   `last_states` and `async_dump_states()` rewrites the file.
 - `STORAGE_KEEP` guards the `.storage` prefix match so `core.*`, `hacs.*` and
@@ -224,7 +286,18 @@ backup taken beforehand is the only way back.
 
 ### Verified against HA 2026.8.3
 
-Cleanup of an integration with a large tombstone backlog:
+A synthetic domain seeded with three orphaned tombstones plus one tombstone
+owned by a live config entry:
+
+| step | result |
+| --- | --- |
+| dry run | offered the 3 orphans; the owned tombstone excluded |
+| checkbox field | `multiple: true`, `mode: list`, all 3 options ticked by default |
+| `entity_filter: *orphan_2*` | published exactly one checkbox |
+| apply with one entity selected | purged that one; the other two and the owned one remained |
+| apply with no selection | purged the remaining two; the owned tombstone still protected |
+
+An earlier whole-domain run, on a real integration with a large backlog:
 
 | | before | after |
 | --- | --- | --- |
@@ -233,11 +306,6 @@ Cleanup of an integration with a large tombstone backlog:
 | `core.restore_state` rows | 75 | 0 |
 | `.storage/<domain>_*` files | 3 | 0 |
 | live entities / devices (all integrations) | 59 / 14 | 59 / 14 |
-
-Scan and dropdown: a synthetic tombstone under a throwaway domain appeared as
-`zz_probe_domain - 1 entity tombstone` with `custom_value: True`; cleaning it
-emptied the candidate list and the `domain` field reverted to its declared text
-selector. `person` (live entities, no tombstones) was correctly not offered.
 
 ## License
 
