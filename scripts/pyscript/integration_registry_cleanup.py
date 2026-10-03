@@ -140,14 +140,22 @@ def _device_container(dev_reg):
     """Live device container.
 
     `DeviceRegistry.devices` became a deprecation-reporting view in 2026.9, so
-    prefer the private attribute and fall back for older cores.
+    prefer the private attribute and fall back for older cores.  Fall back only
+    when the attribute is missing: an empty container is falsy, and `or` would
+    then touch the deprecated property on every current core.
     """
-    return getattr(dev_reg, "_devices", None) or dev_reg.devices
+    container = getattr(dev_reg, "_devices", None)
+    return dev_reg.devices if container is None else container
 
 
 def _deleted_device_container(dev_reg):
-    """Tombstoned device container, same deprecation story as above."""
-    return getattr(dev_reg, "_deleted_devices", None) or dev_reg.deleted_devices
+    """Tombstoned device container, same deprecation story as above.
+
+    With no device tombstones the container is empty, which is the case that
+    used to log the `deleted_devices` deprecation warning.
+    """
+    container = getattr(dev_reg, "_deleted_devices", None)
+    return dev_reg.deleted_devices if container is None else container
 
 
 def _device_entry_id(device):

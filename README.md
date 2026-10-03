@@ -326,7 +326,9 @@ backup taken beforehand is the only way back.
   `list_statistic_ids`, which queries the recorder database.
 - `DeviceRegistry.devices` and `.deleted_devices` became deprecation-reporting
   views in 2026.9, so `_devices` / `_deleted_devices` are preferred with a
-  fallback for older cores.
+  fallback for older cores. The fallback is taken only when the private
+  attribute is missing, not when it is empty: with no device tombstones an
+  `or` fallback reached `.deleted_devices` and logged the deprecation warning.
 - `RestoreStateData` has no scheduled save; entries are popped from
   `last_states` and `async_dump_states()` rewrites the file.
 - `STORAGE_KEEP` guards the `.storage` prefix match so `core.*`, `hacs.*` and
