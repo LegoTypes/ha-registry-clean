@@ -95,6 +95,10 @@ one. It registers two actions:
 
 ### Prerequisites: pyscript, from HACS
 
+The script needs **Home Assistant 2026.11 or later**: it works with the
+registries and restore state as that release reshaped them (see the design notes
+below), and older cores are not supported.
+
 The script runs inside the [pyscript](https://github.com/custom-components/pyscript)
 custom integration, which is in the HACS default store — no custom repository
 needed for it:
@@ -156,17 +160,27 @@ class DeletedDeviceEntry:
 | live entity | `None` | **never touched** — this is how YAML integrations register (`person`) |
 | device | no surviving entry | **purge** |
 
-Two consequences worth knowing:
+Three consequences worth knowing:
 
 - **One deleted device can be cleaned while others keep running.** An
   integration with two panels configured, one of them deleted, leaves only the
   deleted one's entries ownerless. There is no "delete the integration first"
   step and no domain-wide refusal.
-- **Sub-devices need no special handling.** A device belongs to exactly one
-  config entry (`config_entries` is now a deprecated shim around
-  `config_entry_id`), and `via_device_id` links a sub-device to its parent
-  without affecting ownership. A sub-device of a live entry is protected; a
-  sub-device of a deleted one orphans along with its parent.
+- **Child devices go with their parent.** A device belongs to exactly one config
+  entry, and `via_device_id` links a device to the one it connects through
+  without affecting ownership. Child devices, kept in a `child_devices`
+  container of their own since 2026.11, share their parent's config entry, so
+  they orphan along with it, and core removes them whenever the parent is
+  removed. Ticking a parent therefore takes its children with it whatever their
+  own boxes say, and the report lists them.
+- **A device tombstone belongs to the domain recorded on it.** Core records the
+  owning integration's domain on a device when it is deleted, and only ever
+  restores an orphaned tombstone into a config entry of that domain. The scan
+  files tombstones by that record, so an identifier borrowed from another
+  integration (a `marketplace` tombstone carrying a `hacs` identifier, say)
+  cannot make one integration's cleanup purge another's. Tombstones with no
+  recorded domain, and live devices whose config entry is gone, are filed under
+  the domains their identifiers name.
 
 ### Scan and the domain dropdown
 
@@ -260,14 +274,17 @@ States expire under the recorder's retention (10 days by default), but
 long-term statistics are kept forever, so a deleted integration's statistics sit
 in the recorder database indefinitely and show up in **Developer Tools →
 Statistics** as no longer being recorded. `purge_statistics` clears them for the
-entity_ids being purged, via `list_statistic_ids` and the recorder's
-`async_clear_statistics`.
+entity_ids being purged, via `list_statistic_ids` on the recorder's own database
+executor and the recorder's `async_clear_statistics`.
 
-One guard matters: **entity ids get recycled**. An id that something currently
-uses is never cleared, because a working entity that inherited a purged
-tombstone's entity_id would otherwise lose its history. Statistics are also
-*not* covered by the backup below — they live in the recorder database, not in
-`.storage`.
+One guard matters: **entity ids get recycled**. An id that something the purge
+leaves in place still uses — a surviving registry entry, or a running entity — is
+never cleared, because a working entity that inherited a purged tombstone's
+entity_id would otherwise lose its history. The entries being purged do not
+count as users, and neither do the `restored` placeholder states core writes for
+registry entries nothing has loaded, so a stale entity's statistics go with it.
+Statistics are also *not* covered by the backup below — they live in the
+recorder database, not in `.storage`.
 
 ### Backup and recovery
 
@@ -312,9 +329,9 @@ backup taken beforehand is the only way back.
 - The registries are edited **in memory** through `entity_registry.async_get` /
   `device_registry.async_get`. Editing the `.storage` JSON directly does not
   work: Home Assistant overwrites it on the next flush of its in-memory copy.
-- Removing a live orphan creates a tombstone of its own, so the tombstone sweep
-  runs against a freshly collected list rather than the one gathered for the
-  report.
+- Removing a live orphan creates a tombstone of its own, keyed by the entity's
+  `(domain, platform, unique_id)` or by the device's id, so the sweep pops those
+  by key along with the selected tombstones.
 - The dropdown and the checkbox lists are published with
   `async_set_service_schema`, the same helper pyscript itself calls to publish a
   docstring's YAML. The already-registered description is read back with
@@ -322,23 +339,53 @@ backup taken beforehand is the only way back.
   single source of truth and the declared selectors can be restored.
 - `task.executor` accepts only real Python functions, never pyscript-defined
   ones, so blocking work is handed to stdlib callables one call at a time
-  (`os.listdir`, `shutil.copy2`, `shutil.move`, `os.remove`), plus
-  `list_statistic_ids`, which queries the recorder database.
-- `DeviceRegistry.devices` and `.deleted_devices` became deprecation-reporting
-  views in 2026.9, so `_devices` / `_deleted_devices` are preferred with a
-  fallback for older cores. The fallback is taken only when the private
-  attribute is missing, not when it is empty: with no device tombstones an
-  `or` fallback reached `.deleted_devices` and logged the deprecation warning.
-- `RestoreStateData` has no scheduled save; entries are popped from
-  `last_states` and `async_dump_states()` rewrites the file.
+  (`os.listdir`, `shutil.copy2`, `shutil.move`, `os.remove`).
+  `list_statistic_ids` queries the recorder database, so it runs on the
+  recorder's own executor instead (`get_instance(hass).async_add_executor_job`);
+  the recorder's SQLite connection pool warns about any other thread. That call
+  returns a future, which pyscript only waits for under an explicit `await`.
+- Devices are enumerated by iterating `DeviceRegistry.devices`, the supported
+  form of what became a deprecation-reporting view in 2026.9, plus
+  `child_devices`. Tombstones have no public accessor — `.deleted_devices` is
+  deprecated as an internal detail and logs a warning on every access — so
+  `_deleted_devices`, the container core's own orphan purge deletes from, is
+  used directly. Ownership is read from `config_entry_id` alone; the
+  `config_entries` shim logs a deprecation warning and goes in 2027.10.
+- Since 2026.11 `RestoreStateData` files a stored state under the registry id of
+  the entry that saved it (`last_states_by_entity_registry_id`), and by
+  entity_id only for an entity with no registry entry (`last_states_by_entity_id`)
+  — which also holds states older cores saved for entities that were already
+  tombstones when the file was loaded, and which core hands to the next entry
+  created with that entity_id. The purged entries' own registry ids are popped
+  from the first index; an entity_id is popped from the second only while
+  nothing else uses it, by the same rule as statistics. Restore state has no
+  scheduled save, so `async_dump_states()` rewrites the file.
 - `STORAGE_KEEP` guards the `.storage` prefix match so `core.*`, `hacs.*` and
   `lovelace*` files are never claimed by a domain name.
 - The cleanup's persistent notification id is per-domain, so cleaning two
   integrations leaves two notifications rather than one overwriting the other.
 
-### Verified against HA 2026.8.3
+### Verified against HA 2026.11.0
 
-A synthetic domain seeded with three orphaned tombstones plus one tombstone
+With pyscript 2.1.1, on a test instance holding a real integration's backlog,
+running with `purge_storage` and `purge_statistics`:
+
+| step | result |
+| --- | --- |
+| dry run | 216 entity tombstones, 2 device tombstones, 71 restore state rows (all filed by registry id), 1 shared `.storage` file, 122 statistic ids; 216 / 2 checkboxes published |
+| apply: registries | target domain 216 → 0 entity and 2 → 0 device tombstones; other domains' tombstones and all 63 / 13 live entities / devices untouched |
+| apply: restore state | 85 → 14 rows; only the target's 71 removed, the file rewritten at once |
+| apply: statistics | the 122 statistic ids gone from the recorder |
+| delete a throwaway config entry (`moon`) | the dropdown offered it about five seconds later with no scan; the cleanup then emptied it again |
+| log | no deprecation or database-executor warnings |
+
+Dry runs on a second instance, with a MariaDB recorder, queried statistics for
+the orphaned entity_ids that nothing had reused and left the recycled ones out.
+
+### Earlier: verified against HA 2026.8.3
+
+The selection logic these steps exercise is unchanged since. A synthetic domain
+seeded with three orphaned tombstones plus one tombstone
 owned by a live config entry:
 
 | step | result |

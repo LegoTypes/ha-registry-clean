@@ -18,9 +18,14 @@ deleted, so ``config_entry_id is None`` (or an id that no longer exists) means
     # owning config entry has been removed
 
 That makes it safe to clean one deleted panel while another panel of the same
-integration keeps running, and it covers sub-devices for free -- a device
-belongs to exactly one config entry, and via_device_id does not affect
-ownership.
+integration keeps running.  A device belongs to exactly one config entry and
+via_device_id does not affect ownership; child devices share their parent's
+config entry, and core removes them together with the parent.
+
+A device tombstone is filed under the domain core recorded on it when it was
+deleted, because core only ever restores an orphaned tombstone into a config
+entry of that domain.  Only tombstones without a recorded domain, and live
+devices whose config entry is gone, are filed under their identifiers' domains.
 
 The one exception is a *live* entity with no config entry at all: that is how
 YAML-configured integrations register (``person`` and friends), so live entries
@@ -38,7 +43,7 @@ pyscript.integration_registry_cleanup
 
   domain           integration domain to purge             (required)
   dry_run          report only, and publish the checkboxes (default: true)
-  filter           entity_id glob narrowing the candidates
+  entity_filter    entity_id glob narrowing the candidates
   entities         entity_ids to purge; the dry run fills these in
   devices          device ids to purge; likewise
   purge_storage    also remove the integration's .storage files and its
@@ -69,6 +74,11 @@ that backup; they live in the recorder database.
 
 For the same reason the registries are edited in memory through the registry
 APIs here, never by writing .storage directly.
+
+Written against the Home Assistant 2026.11 registries and restore state:
+stored states are filed under the registry id of the entry that saved them,
+child devices live in a container of their own, and device tombstones record
+their domain.  Older cores are not supported.
 """
 
 import copy
@@ -78,6 +88,7 @@ import os
 import shutil
 import time
 
+from homeassistant.const import EntityStateAttribute
 from homeassistant.helpers import (
     device_registry as dr,
     entity_registry as er,
@@ -136,54 +147,56 @@ def _live_entry_ids():
     return set([entry.entry_id for entry in hass.config_entries.async_entries()])
 
 
-def _device_container(dev_reg):
-    """Live device container.
+def _live_devices(dev_reg):
+    """Every device and child device currently registered.
 
-    `DeviceRegistry.devices` became a deprecation-reporting view in 2026.9, so
-    prefer the private attribute and fall back for older cores.  Fall back only
-    when the attribute is missing: an empty container is falsy, and `or` would
-    then touch the deprecated property on every current core.
+    Iterating `DeviceRegistry.devices` is the supported way to enumerate devices;
+    using it as a mapping is deprecated.  Child devices are not among them: they
+    have a container of their own, published as `child_devices`.
     """
-    container = getattr(dev_reg, "_devices", None)
-    return dev_reg.devices if container is None else container
+    return list(dev_reg.devices) + list(dev_reg.child_devices)
 
 
 def _deleted_device_container(dev_reg):
-    """Tombstoned device container, same deprecation story as above.
+    """The device tombstones, keyed by device id.
 
-    With no device tombstones the container is empty, which is the case that
-    used to log the `deleted_devices` deprecation warning.
+    `DeviceRegistry.deleted_devices` is deprecated as an internal detail and
+    logs a warning on every access, and nothing public enumerates or removes
+    tombstones, so this is the container core's own orphan purge deletes from.
     """
-    container = getattr(dev_reg, "_deleted_devices", None)
-    return dev_reg.deleted_devices if container is None else container
-
-
-def _device_entry_id(device):
-    """The config entry a device belongs to.
-
-    A device now belongs to exactly one config entry; `config_entries` is a
-    deprecated shim around it.  Older cores only have the set.
-    """
-    entry_id = getattr(device, "config_entry_id", None)
-    if entry_id is not None:
-        return entry_id
-    entries = getattr(device, "config_entries", None) or set()
-    for candidate in entries:
-        return candidate
-    return None
+    return dev_reg._deleted_devices
 
 
 def _device_domains(device):
-    """Every integration domain a device (live or tombstoned) belongs to."""
+    """The integration domains a device (live or tombstoned) is filed under.
+
+    Core only restores an orphaned tombstone into a config entry of the domain
+    recorded on it, so that record is authoritative: an identifier borrowed from
+    another integration must not let this integration's cleanup purge the other
+    one's tombstone.  Tombstones from before domains were recorded, and live
+    devices whose config entry is gone, only have their identifiers to go by.
+    """
+    if isinstance(device, dr.DeletedDeviceEntry) and device.domain:
+        return set([device.domain])
     domains = set()
     for identifier in device.identifiers:
         if len(identifier):
             domains.add(identifier[0])
-    # DeletedDeviceEntry records the owning integration explicitly.
-    explicit = getattr(device, "domain", None)
-    if explicit:
-        domains.add(explicit)
     return domains
+
+
+def _with_child_devices(dev_reg, devices):
+    """`devices` plus every child device core removes along with them.
+
+    Removing a device removes its child devices whatever their own checkbox or
+    domain says, so the report and the tombstone sweep must include them.
+    """
+    chosen = dict([(device.id, device) for device in devices])
+    for device in devices:
+        if isinstance(device, dr.DeviceEntry):
+            for child in dr.async_entries_for_parent_device(dev_reg, device.id):
+                chosen[child.id] = child
+    return list(chosen.values())
 
 
 def _device_label(device):
@@ -240,17 +253,16 @@ def _collect(domain, pattern, live_entry_ids):
 
     live_devices = [
         device
-        for device in list(_device_container(dev_reg).values())
+        for device in _live_devices(dev_reg)
         if domain in _device_domains(device)
-        and _device_entry_id(device) is not None
-        and _device_entry_id(device) not in live_entry_ids
+        and device.config_entry_id not in live_entry_ids
     ]
 
     dead_devices = [
         (key, device)
         for key, device in list(_deleted_device_container(dev_reg).items())
         if domain in _device_domains(device)
-        and _is_orphan(_device_entry_id(device), live_entry_ids)
+        and _is_orphan(device.config_entry_id, live_entry_ids)
     ]
 
     return live_entities, dead_entities, live_devices, dead_devices
@@ -286,28 +298,80 @@ def _storage_candidates(domain, names, storage_dir, live_entry_ids, domain_has_l
     return sorted(matched)
 
 
-def _statistic_ids_for(entity_ids):
-    """Long-term statistics belonging to entity_ids that nothing uses now.
+def _entity_ids_in_use(purged_registry_ids):
+    """Entity ids that something the purge leaves in place still uses.
 
-    Entity ids are recycled, so an id that something currently owns is left
-    alone -- clearing it would destroy a working entity's history.
+    Entity ids are recycled, so history or a stored state filed under an id that
+    a surviving registry entry or a running entity now uses belongs to that
+    entity.  The entries being purged do not count, and neither do the
+    `restored` placeholder states core writes for registry entries nothing has
+    loaded -- a placeholder is all a stale entry ever has.
+    """
+    ent_reg = er.async_get(hass)
+    in_use = set(
+        [
+            entry.entity_id
+            for entry in ent_reg.entities.values()
+            if entry.id not in purged_registry_ids
+        ]
+    )
+    for state in hass.states.async_all():
+        if not state.attributes.get(EntityStateAttribute.RESTORED):
+            in_use.add(state.entity_id)
+    return in_use
+
+
+def _stored_states_for(restore_data, purged_entries, in_use):
+    """Stored states that would hand a purged entity's last state to a successor.
+
+    Core files a stored state under the registry id of the entry that saved it,
+    and under the entity_id only for an entity with no registry entry -- which
+    also catches states saved by older cores for entities that were already
+    tombstones when the file was loaded.  Those are handed to the next registry
+    entry created with that entity_id.  A registry id belongs to one entry
+    alone, so a match is always the purged entry's own state; an entity_id is
+    only claimed while nothing else uses it.
+
+    Returns (registry_ids, entity_ids): the keys to pop from each index.
+    """
+    by_registry_id = restore_data.last_states_by_entity_registry_id
+    by_entity_id = restore_data.last_states_by_entity_id
+    registry_ids = sorted(
+        [entry.id for entry in purged_entries if entry.id in by_registry_id]
+    )
+    entity_ids = sorted(
+        set(
+            [
+                entry.entity_id
+                for entry in purged_entries
+                if entry.entity_id in by_entity_id and entry.entity_id not in in_use
+            ]
+        )
+    )
+    return registry_ids, entity_ids
+
+
+def _statistic_ids_for(entity_ids, in_use):
+    """Long-term statistics belonging to purged entity_ids that nothing uses now.
+
+    An id something still uses is left alone -- clearing it would destroy a
+    working entity's history.
     """
     if list_statistic_ids is None or _recorder_instance is None:
         return None
     if "recorder" not in hass.config.components:
         return None
-    ent_reg = er.async_get(hass)
-    in_use = set(ent_reg.entities.keys())
     candidates = set(
-        [
-            entity_id
-            for entity_id in entity_ids
-            if entity_id not in in_use and hass.states.get(entity_id) is None
-        ]
+        [entity_id for entity_id in entity_ids if entity_id not in in_use]
     )
     if not candidates:
         return []
-    rows = task.executor(list_statistic_ids, hass, candidates)
+    # Database work belongs on the recorder's own executor; its connection pool
+    # reports any other thread.  This returns a future, which pyscript only
+    # waits for when told to.
+    rows = await _recorder_instance(hass).async_add_executor_job(
+        list_statistic_ids, hass, candidates
+    )
     return sorted([row["statistic_id"] for row in rows])
 
 
@@ -527,14 +591,13 @@ def _scan(refresh_selector, selection=None):
         ):
             _bucket(found, platform)["deleted_entities"] += 1
 
-    for device in list(_device_container(dev_reg).values()):
-        entry_id = _device_entry_id(device)
-        if entry_id is not None and entry_id not in live_entry_ids:
+    for device in _live_devices(dev_reg):
+        if device.config_entry_id not in live_entry_ids:
             for domain in _device_domains(device):
                 _bucket(found, domain)["live_devices"] += 1
 
     for device in list(_deleted_device_container(dev_reg).values()):
-        if _is_orphan(_device_entry_id(device), live_entry_ids):
+        if _is_orphan(device.config_entry_id, live_entry_ids):
             for domain in _device_domains(device):
                 _bucket(found, domain)["deleted_devices"] += 1
 
@@ -660,7 +723,8 @@ fields:
         options: []
   devices:
     description: >-
-      Devices to purge. A dry run fills this in the same way.
+      Devices to purge. A dry run fills this in the same way. Removing a device
+      also removes its child devices.
     selector:
       select:
         multiple: true
@@ -780,6 +844,7 @@ fields:
         wanted = set(chosen_devices)
         live_devices = [d for d in live_devices if d.id in wanted]
         dead_devices = [(k, d) for k, d in dead_devices if d.id in wanted]
+    live_devices = _with_child_devices(dr.async_get(hass), live_devices)
 
     result["entities_removed"] = sorted([entry.entity_id for entry in live_entities])
     result["deleted_entities_purged"] = sorted(
@@ -790,20 +855,25 @@ fields:
         [_device_label(d) for _key, d in dead_devices]
     )
 
-    owned_entity_ids = set(result["entities_removed"])
-    for _key, entry in dead_entities:
-        owned_entity_ids.add(entry.entity_id)
+    purged_entities = live_entities + [entry for _key, entry in dead_entities]
+    owned_entity_ids = set([entry.entity_id for entry in purged_entities])
+    in_use = _entity_ids_in_use(set([entry.id for entry in purged_entities]))
 
     restore_data = None
+    stored_registry_ids = []
+    stored_entity_ids = []
     storage_files = []
     if purge_storage:
         restore_data = rs.async_get(hass)
+        stored_registry_ids, stored_entity_ids = _stored_states_for(
+            restore_data, purged_entities, in_use
+        )
+        stored = set(stored_registry_ids)
         result["restore_state_purged"] = sorted(
-            [
-                entity_id
-                for entity_id in list(restore_data.last_states)
-                if entity_id in owned_entity_ids
-            ]
+            set(
+                [entry.entity_id for entry in purged_entities if entry.id in stored]
+                + stored_entity_ids
+            )
         )
         storage_files = _storage_candidates(
             domain,
@@ -816,7 +886,7 @@ fields:
 
     statistic_ids = []
     if purge_statistics:
-        found = _statistic_ids_for(owned_entity_ids)
+        found = _statistic_ids_for(owned_entity_ids, in_use)
         if found is None:
             result["statistics_note"] = "recorder unavailable; statistics untouched"
         else:
@@ -855,26 +925,29 @@ fields:
 
     for entry in live_entities:
         ent_reg.async_remove(entry.entity_id)
+    # Children first: removing a parent removes its child devices with it, and
+    # removing one of those a second time would fail.
     for device in live_devices:
-        dev_reg.async_remove_device(device.id)
+        if isinstance(device, dr.ChildDeviceEntry):
+            dev_reg.async_remove_device(device.id)
+    for device in live_devices:
+        if not isinstance(device, dr.ChildDeviceEntry):
+            dev_reg.async_remove_device(device.id)
 
-    # async_remove turns each live entry into a tombstone of its own, and those
-    # are orphans too, so the sweep runs against a freshly collected list.
-    _live, dead_entities, _live_dev, dead_devices = _collect(
-        domain, entity_filter, live_entry_ids
-    )
-    if chosen_entities:
-        wanted = set(chosen_entities)
-        dead_entities = [(k, e) for k, e in dead_entities if e.entity_id in wanted]
-    if chosen_devices:
-        wanted = set(chosen_devices)
-        dead_devices = [(k, d) for k, d in dead_devices if d.id in wanted]
-
-    # .pop() on these containers goes through __delitem__, which keeps the
-    # registries' internal indexes consistent.
+    # Each removal above leaves a tombstone of its own -- keyed by the entity's
+    # (domain, platform, unique_id) or by the device's id -- owned by a config
+    # entry that no longer exists, so those go along with the selected ones.
+    # .pop() on the device container goes through __delitem__, which keeps its
+    # indexes consistent.
     dead_device_container = _deleted_device_container(dev_reg)
+    for entry in live_entities:
+        ent_reg.deleted_entities.pop(
+            (entry.domain, entry.platform, entry.unique_id), None
+        )
     for key, _entry in dead_entities:
         ent_reg.deleted_entities.pop(key, None)
+    for device in live_devices:
+        dead_device_container.pop(device.id, None)
     for key, _device in dead_devices:
         dead_device_container.pop(key, None)
 
@@ -884,9 +957,11 @@ fields:
         dev_reg.async_schedule_save()
 
     if purge_storage:
-        for entity_id in result["restore_state_purged"]:
-            restore_data.last_states.pop(entity_id, None)
-        if result["restore_state_purged"]:
+        for registry_id in stored_registry_ids:
+            restore_data.last_states_by_entity_registry_id.pop(registry_id, None)
+        for entity_id in stored_entity_ids:
+            restore_data.last_states_by_entity_id.pop(entity_id, None)
+        if stored_registry_ids or stored_entity_ids:
             # restore_state has no scheduled save; rewrite the file now.
             restore_data.async_dump_states()
         if storage_files:
